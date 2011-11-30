@@ -1,0 +1,407 @@
+<?php
+// $Id: mcapi.install,v 1.1.2.4 2010/12/15 22:04:03 matslats Exp $
+
+/**
+ * @file
+ * Install, update and uninstall functions for the transactions module.
+ */
+
+/**
+ * Implements hook_install().
+ */
+function mcapi_install() {
+
+  //permit authenticated user to trade by default
+  if (!user_roles(FALSE, 'transact')) {
+    db_merge('role_permission')
+    ->key(array('permission' => 'transact', 'rid' => DRUPAL_AUTHENTICATED_RID))
+    ->fields(array('module' => 'mcapi'))
+    ->execute();
+  }
+  drupal_set_message(t("Authenticated user has been granted 'transact' permission."));
+
+  //here we set all the module weights together
+  //the main module must be heavier than contact module, because it needs to modify after contact_form_alter
+  //could all these be done in one query?
+  db_update('system')->fields(array('weight' => -1))->condition('name', 'mcapi')->execute(); //before ctools
+  db_update('system')->fields(array('weight' => 2))->condition('name', 'mcapi_currencies')->execute();
+  db_update('system')->fields(array('weight' => 2))->condition('name', 'mcapi_webforms')->execute();
+  db_update('system')->fields(array('weight' => 2))->condition('name', 'mcapi_limits')->execute();
+  db_update('system')->fields(array('weight' => 3))->condition('name', 'mcapi_services')->execute();
+  db_update('system')->fields(array('weight' => 3))->condition('name', 'mcapi_pending')->execute();
+  db_update('system')->fields(array('weight' => 4))->condition('name', 'mcapi_limits_equation')->execute();
+  db_update('system')->fields(array('weight' => 4))->condition('name', 'mcapi_display')->execute();
+
+  //allow the body field to be added to currencies and transactions
+  if ($data = unserialize(db_query("SELECT data from {field_config} where field_name = 'body'")->fetchField())) {
+    if (!in_array('transaction', $data['entity_types'])) {
+      $data['entity_types'][] = 'transaction';
+    }
+    $data_col = serialize($data);
+    db_update('field_config')->fields(array('data' => $data_col))->condition('field_name', 'body')->execute();
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ * Remove any tables or variables that the module sets.
+ */
+function mcapi_uninstall() {
+  //delete all the entities manually if there are less than 400.
+  //however it doesn't work because the table has already been removed...
+  $xids = db_query("SELECT xid FROM (mcapi_transactions)")->fetchCol();
+  foreach ($xids as $xid) {
+    //module_invoke_all('entity_delete', transaction_load($xid), 'transaction');
+  }
+  //delete all the views this module declared
+  if (module_exists('views')) {
+    $view_ids = db_query("SELECT vid FROM {views_view} WHERE tag = 'mcapi'");
+    while ($vid = $view_ids->fetchField()) {
+      // TODO Please review the conversion of this statement to the D7 database API syntax.
+      /* db_query("DELETE FROM {views_view} WHERE vid = %d", $vid) */
+      db_delete('views_view')
+      ->condition('vid', $vid)
+      ->execute();
+      db_delete('views_display')
+      ->condition('vid', $vid)
+      ->execute();
+    }
+  }
+
+  //truncate the tables containing field_api data
+  db_query('TRUNCATE table {field_data_worth}');
+  db_query('TRUNCATE table {field_revision_worth}');
+  
+  variable_del('mcapi_controller');
+  variable_del('mcapi_db_read');
+  variable_del('mcapi_db_write');
+  variable_del('currency_default');
+  cache_clear_all('currencies', 'cache');
+}
+
+/**
+ * Implements hook_enable
+ */
+function mcapi_enable() {
+  global $language;
+
+  mcapi_check_fields();
+  cache_clear_all("entity_info:".$language->language, 'cache');
+  //this seems to have been omitted from core...
+  menu_rebuild();
+}
+
+/**
+ * Implements of hook_schema)()
+ */
+function mcapi_schema() {
+  $numeric = array(
+    'type' => 'numeric',
+    'size' => 'normal',
+    'precision' => 8,
+    'scale' => 2
+  );
+  $schema['mcapi_transactions'] = array(
+    'description' => 'currency transactions between users',
+    'fields' => array(
+      'xid' => array(
+        'description' => 'the unique transaction ID',
+        'type' => 'serial',
+        'size' => 'normal',
+      ),
+      'payer' => array(
+        'description' => 'the user id of the payer',
+        'type' => 'int',
+        'size' => 'small',
+      ),
+      'payee' => array(
+        'description' => 'the user id of the payee',
+        'type' => 'int',
+        'size' => 'small',
+      ),
+      'type' => array(
+        'description' => 'The type of transaction, types are provided by modules',
+        'type' => 'varchar',
+        'length' => '32',
+      ),
+      'state' => array(
+        'description' => "completed, pending, disputed, etc",
+        'type' => 'int',
+        'size' => 'normal',
+        'not null' => TRUE,
+        'default' => 0
+      ),
+      'data' => array(
+        'description' => 'nonessential info not fitting into existing fields',
+        'type' => 'text',
+        'size' => 'small',
+        'serialize' => TRUE,
+      ),
+      'creator' => array(
+        'description' => 'the user id of the creator',
+        'type' => 'int',
+        'size' => 'small',
+      ),
+      'created' => array(
+        'description' => "Unixtime that the transaction was recorded",
+        'type' => 'int',
+        'size' => 'normal',
+      ),
+      'modifier' => array(
+        'description' => 'the user id of the modifier',
+        'type' => 'int',
+        'size' => 'small',
+      ),
+      'modified' => array(
+        'description' => "Unixtime that the transaction was modified",
+        'type' => 'int',
+        'size' => 'normal',
+      ),
+    ),
+    'primary key' => array('xid'),
+  );
+  return $schema;
+}
+
+function mcapi_check_fields() {
+  if (!field_read_field('worth', array('include_inactive' => TRUE))) {
+    $field = array(
+      'field_name' => 'worth',
+      'type' => 'worth_field',
+      'entity_types' => array('transaction', 'node', 'user'),
+    );
+    field_create_field($field);
+  }
+  else {
+    debug("activating preexisting field 'worth'");
+    db_query("UPDATE {field_config} SET active = 1 WHERE field_name = 'worth'");
+  }
+  // Create the instance if needed.
+  if (!field_read_instance('transaction', 'worth', 'transaction', array('include_inactive' => TRUE))) {
+    $instance = array(
+      'field_name' => 'worth',
+      'label' => t('Value'),
+      'entity_type' => 'transaction',
+      'bundle' => 'transaction',
+      'settings' => array(),
+      'required' => TRUE,
+      'display' => array(
+        'default' => array(
+          'label' => 'hidden',
+          'type' => 'text_default',
+          'weight' => 0,
+        ),
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  //add the body field
+  if (!field_read_instance('transaction', 'body', 'transaction', array('include_inactive' => TRUE))) {
+    field_create_instance(array(
+      'label' => 'Details',
+      'settings' => array(
+        'text_processing' => '0',
+        'display_summary' => 0,
+      ),
+      'required' => 1,
+      'display' => array(
+        'default' => array(
+          'label' => 'hidden',
+          'type' => 'text_default',
+          'weight' => 3,
+          'settings' => array(),
+          'module' => 'text',
+        ),
+      ),
+      'widget' => array(
+        'weight' => 3,
+        'type' => 'text_long',
+        'module' => 'text',
+        'active' => 1,
+        'settings' => array(
+          'rows' => '3',
+          'summary_rows' => 1,
+        ),
+      ),
+      'description' => '',
+      'default_value' => NULL,
+      'field_name' => 'body',
+      'entity_type' => 'transaction',
+      'bundle' => 'transaction',
+      'deleted' => '0',
+    ));
+  }
+}
+
+
+/*
+ *
+ */
+function mcapi_controller_options_form($form_state) {
+  cache_clear_all('*', 'cache');
+  $controllers = module_implements('transaction_controller');
+  $form['mcapi_controller'] = array(
+    '#title' => 'Entity controller file',
+    '#description' => t('Choose which module, with a .controller file, to use.'),
+    '#type' => 'radios',
+    '#options' => drupal_map_assoc($controllers),
+    '#default_value' => variable_get('mcapi_controller', 'mcapi'),
+    '#ajax' => array(
+      'callback' => 'mcapi_controller_options_form_ajax',
+      'wrapper' => 'mcapi-controller-options-form',
+    ),
+  );
+
+  global $databases;
+  if (variable_get('mcapi_controller', 'mcapi') == 'mcapi') {
+    foreach($databases as $key => $data) {
+      $options[$key] = $key;
+    }
+    $form['master_slave'] = array(
+      '#title' => t('Databases'),
+      '#description' => t('See @file for how to enable more databases.', array('@file' => 'settings.php')) .' '.
+        t('Write accounting information to more than one database, and read from one database, making a sort of master/slave arrangement.') .' '.
+        t("Don't forget each database connection itself can have master/slave arrangement, but we are concerned only with accounting here.") .' '.
+        t("the database should be appropriate for the controller."),
+      '#type' => 'fieldset',
+      '#attributes' => array('id' => 'master-slave'),
+    );
+    $form['master_slave']['mcapi_db_write'] = array(
+      '#title' => t('Write accounting information to'),
+      '#description' => t('See @file for how to enable more databases.', array('@file' => 'settings.php')) .' '.
+        t('Use with caution as fields added to transactions and currencies will still be saved locally') .' '.
+        t("the database should be appropriate for the controller."),
+      '#type' => 'checkboxes',
+      '#options' => $options,
+      '#default_value' => variable_get('mcapi_db_write', array('default'=>'default')),
+      '#ajax' => array(
+        'callback' => 'mcapi_controller_options_form_ajax',
+        'wrapper' => 'master-slave',
+      ),
+    );
+    $form['master_slave']['mcapi_db_read'] = array(
+      '#title' => t('Read accounting information from'),
+      '#type' => 'select',
+      '#options' =>  $options,
+      '#default_value' => variable_get('mcapi_db_read', 'default'),
+      '#weight' => 1,
+    );
+  }
+  return system_settings_form($form);
+}
+function mcapi_controller_options_form_ajax($form, $form_state) {
+  $form['master_slave']['mcapi_db_read']['#options'] = array_filter($form_state['values']['mcapi_db_write']);
+  return $form;
+}
+
+
+/**
+ * Implements hook_field_schema().
+ */
+function mcapi_field_schema($field) {
+  if ($field['type'] == 'worth_field') {
+    return array(
+      'columns' => array(
+        'currcode' => array(
+          'description' => 'The currency ID',
+          'type' => 'varchar',
+          'length' => '8',
+        ),
+        'quantity' => array(
+          'description' => 'Price',
+          'type' => 'numeric',
+          'size' => 'normal',
+          'precision' => 8,
+          'scale' => 2
+        )
+      )
+    );
+  }
+}
+
+function _mcapi_update_7000() {
+  module_enable(array('mcapi_limits'));
+  //first of all we need to tweak the currency objects, which used to be nodes and now are views.
+  $old_currency = db_query("SELECT * FROM {mc_currencies} c LEFT JOIN {node} n ON c.nid = n.nid")->fetch();
+  $old_currency->data = unserialize($old_currency->data);
+  $currency = array_pop(currencies_load());
+  $currency->info['currcode'] = substr($old_currency->title, 0, 8);
+  $currency->name = $old_currency->title;
+  $currency->format = $old_currency->symbol;
+  //convert the divisions from the saved value to a string
+  if (is_array($old_currency->data['divisions'])) {
+    while (list($key, $val) = each($old_currency->data['divisions'])) {
+      $divisions[] = $key . '|'. $val;
+    }
+    $currency->divisions_setting = implode("\n", $divisions);
+  }
+  else $currency->divisions_setting = '';
+  $currency->limits_callback = 'limits_personal';
+  $currency->limits_personal['min'] = $old_currency->min;
+  $currency->limits_personal['max'] = $old_currency->max;
+  $currency->accounting['update_mode'] = 2;
+
+  variable_set('currency_default', (array)$currency);
+  module_load_include('admin.inc', 'mcapi', 'currencies');
+  currencies_recache();
+  //and make sure the new currency is visible
+  drupal_set_message('The default currency has been upgraded');
+
+  drupal_set_message('If transactions were categorised, the categories have not been upgraded
+    Any other cck fields which had been added to the transaction node-type have not been upgraded, unless via core.
+    Transactions have been imported via the default controller.');
+  //set up the new transaction table
+  drupal_install_schema('mcapi');
+  mcapi_install();
+
+  module_load_include('controller', 'mcapi', variable_get('mcapi_controller', 'default'));
+  //convert each old transaction into a transaction object
+  $transactions = db_query("SELECT * FROM {mc_exchanges} x
+    LEFT JOIN {node} n on n.nid = x.nid
+    LEFT JOIN {node_revision} v on n.vid = v.vid")->fetchAllAssoc('nid');
+  foreach ($transactions as $xid => $old) {
+    $transaction = array(
+      'xid' => $old->nid,
+      'payer' => $old->payer_uid,
+      'payee' => $old->payee_uid,
+      'state' => $old->state,
+      'created' => $old->created,
+      'creator' => $old->uid,
+      'modified' => $old->changed,
+      'modifier' => $old->uid,
+      'type' => $old->exchange_type,
+      'data' => array(),
+      'worth' => array(
+        'und' => array(
+          0 => array(
+            'quantity' => $old->quantity,
+            'currcode' => $currency->info['currcode'] /* need to update currency codes */
+          )
+        )
+      ),
+      'body' => array(
+        'und' => array(
+          0 => array(
+            'value' => $old->title
+          )
+        )
+      ),
+      'is_new' => TRUE
+    );
+    $transaction = (object)$transaction;
+    //this only works once, as an insert
+    mcapi_write_record('mcapi_transactions', $transaction);
+    field_attach_update('transaction', $transaction);
+  }
+  //now we delete the views from the old version
+  $oldviews = array('mc_exchanges_all');
+  foreach ($oldviews as $view) {
+    $view = views_ui_cache_load($viewname);
+    if ($view){
+      $view->delete();
+      views_object_cache_clear('view', $viewname);
+    }
+  }
+}
+

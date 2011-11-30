@@ -1,0 +1,421 @@
+<?php
+// $Id:
+
+define ('TRANSACTION_STATE_PENDING', 1);
+
+
+/*
+ * Introduces a new transaction state, 'pending', and
+ * modifies existing default webforms to create pending transactions
+ * Pending transactions require at least one signature
+ * Required signatures are stored in a db table and deleted.
+ * Signatures happen via menu callbacks
+ * Its possible both to sign a transaction 'off' thus 'finishing' it
+ * Also to sign all a user's transactions.
+ */
+function mcapi_pending_menu() {
+  //this item makes it possible to sign on someone elses behalf, if the link is provided.
+  //That's not in the scope of this module
+
+  $items['transaction/%transaction/signoff'] = array(
+    'title' => 'Sign off transaction',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mcapi_signoff_confirm_form', 1),
+    'access callback' => 'mcapi_pending_signoff_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_ACTION,
+  );
+  $items['user/%user/signall'] = array(
+    'title' => 'Sign all my transactions',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mcapi_signall_confirm_form', 1),
+    'access callback' => 'has_pending',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_ACTION,
+  );
+  return $items;
+}
+
+function mcapi_pending_menu_alter(&$items) {
+  $items['transaction/%transaction/sign']['access callback'] = 'mcapi_pending_sign_access';
+  $items['transaction/%transaction/sign']['access arguments'] = array(1, 3);
+  $items['transaction/%transaction/sign']['type'] = MENU_LOCAL_ACTION;
+}
+
+function has_pending($account) {
+  if (db_query("SELECT count(xid) FROM {mcapi_unsigned} where uid = :uid", array(':uid' => $account->uid))->fetchfield()) {
+    return $account->uid == $GLOBALS['user']->uid || user_access('manage all transactions');
+  }
+}
+//menu access callback
+//does the transaction need signing by that user and
+//is the current user permitted to sign on behalf of that user
+function mcapi_pending_sign_access($transaction) {
+  //check the transaction is pending and the given account needs to sign it.
+  if ($transaction->state != TRANSACTION_STATE_PENDING) return FALSE;
+  $count = db_query(
+    "SELECT count(xid) FROM {mcapi_unsigned} WHERE xid = :xid AND uid = :uid",
+    array(':xid' => $transaction->xid, ':uid' => $GLOBALS['user']->uid)
+  )->fetchfield();
+  if ($count) return FALSE;
+  
+  //check the current user has permission to sign, by virtue of being one of the transactees
+  if (in_array($GLOBALS['user']->uid, $transaction->pending)) return TRUE;
+  //check the user is permitted as an admin.
+  if (user_access('manage all transactions')) {
+    $currency = currency_load($transaction->currcode);
+    if ($currency->pending['signoff']) {
+      return TRUE;
+    }
+  }
+}
+
+//menu access callback
+//can the current user sign off the given transaction
+function mcapi_pending_signoff_access($transaction) {
+  if ($transaction->state == TRANSACTION_STATE_PENDING) {
+    if (user_access('manage all transactions')) return TRUE;
+  }
+}
+/*
+ * Transaction access callback from mcapi module.
+ */
+function mcapi_access_pending($op, $transaction, $account, $currency) {debug('pending access function IS used!');
+  if (user_access('manage all transactions')) return TRUE;
+  $participated = $account->uid == $transaction->payee || $account->uid == $transaction->payer;
+  $owner = $transaction->creator == $account->uid;
+  switch ($op) {
+    case 'view'://users can always view their own pages
+      switch ($currency->pending['access']) {
+        case 0: return $participated;
+        case 1: return $participated || $accountant;
+        case 2: debug('Currency access option 2 needs sorting out');return TRUE;
+          $callback = isset($currency->access_callback) ? $currency->access_callback : 'user_access';
+          return $callback('view', $currency, $GLOBALS['user']->uid);
+        case 2: return $GLOBALS['user']->uid;
+        case 3: return TRUE;
+    }
+    case 'update':
+    case 'erase':
+      if (empty($currency->pending['update_mode'])) return;
+      switch ($currency->user_editable_mode) {
+        case 1: return $account->uid == $currency->uid;
+        case 2: return $owner;
+        case 3: return $participated;
+      }
+  }
+}
+
+function mcapi_pending_mcapi_info($prop) {
+  $info = array(
+    'states' => array(
+      TRANSACTION_STATE_PENDING => t('Pending'),
+    ),
+    'types' => array(),
+  );
+  return $info[$prop];
+}
+
+/*
+ * Will implement hook_entity_load or some such
+ */
+function mcapi_pending_entity_load(&$entities, $type) {
+  if ($type != 'transaction')return;
+  $signatures = db_select('mcapi_unsigned',  'u')
+  ->fields('u')
+  ->condition('xid', array(array_keys($entities)))
+  //->groupby('xid')
+  ->execute()
+  ->fetchAll();
+  //as we put the signatures into the transaction objects, we check that each transaction is pending
+  foreach ($signatures as $signature) {
+    $entities[$signature->xid]->pending[] = $signature->uid;
+  }
+}
+
+
+/*
+ * implements hook_entity_update
+ * calculates the pending balances and saves the required signatures
+ */
+function mcapi_pending_entity_update($type, $transaction) {
+  if ($type == 'transaction') {
+    //resave the signatures to the entity table
+    mcapi_pending_entity_save($transaction);
+  }
+}
+function mcapi_pending_entity_insert($type, $transaction) {
+  if ($type != 'transaction' || $transaction->state != TRANSACTION_STATE_PENDING) return;
+  //load the webform to check if this transaction has any signatories
+  //this is where we actually add the signatures to the transaction object
+  if (module_exists('mcapi_webforms')) {
+    $webform = mcapi_webforms_load($transaction->type);
+    if (!empty($webform->data['2ndperson']['signature'])) {
+      $transaction->pending[] = $transaction->payee == $GLOBALS['user']->uid ? $transaction->payer : $transaction->payee;
+    }
+    else {
+      foreach (array('payer', 'payee') as $participant) {
+        if (!empty($webform->data[$participant]['signature'])){
+          $transaction->pending[] = $transaction->$participant;
+        }
+      }
+    }
+  }
+  else {
+    //make pending for any user who isn't the currency user
+    foreach (array('payer', 'payee') as $participant) {
+      if ($transaction->$participant != $GLOBALS['user']->uid) {
+        $transaction->pending[] = $transaction->$participant;
+      }
+    }
+  }
+  //resave the signatures to the entity table
+  mcapi_pending_entity_save($transaction);
+}
+
+
+function mcapi_pending_entity_save($transaction) {
+  $rows = array();
+  //this module assumes that every pending transaction is awaiting at least one signature
+  //clear all the completers ready for re-adding
+  if (isset($transaction->xid)) {
+    db_query("DELETE FROM {mcapi_unsigned} WHERE xid = ".$transaction->xid);
+  }
+  if (isset($transaction->pending) && count($transaction->pending)) {
+    foreach ($transaction->pending as $uid) {
+      $rows[] = '('. $transaction->xid .', '. $uid .')';
+    }
+    db_query("INSERT INTO {mcapi_unsigned} (xid, uid) VALUES ". implode(', ', $rows));
+  }
+  //this is obselete. Yet to be replaced, I think
+  //recalc_pending($transaction);
+}
+/*
+ * Will implement hook_entity_delete or some such
+ */
+function mcapi_pending_entity_delete($entity, $type) {
+  if ($type = 'transaction' && !empty($entity->pending)) {
+    db_query("DELETE FROM {mcapi_unsigned} WHERE xid = ".$transaction->xid);
+  }
+  //recalc_pending($transaction);
+}
+
+/*
+ * removes one signatory from the transaction object and resaves the transaction
+ */
+function mcapi_sign($transaction, $uid) {
+  $key = array_search($uid, $transaction->pending);
+  unset($transaction->pending[$key]);
+  if (!count($transaction->pending)) {
+    $transaction->state = TRANSACTION_STATE_FINISHED;
+  }
+  transaction_controller('state', $transaction);
+}
+
+
+function mcapi_pending_mcapi_currency_form($form_state, $currency) {
+  $form['pending'] = array(
+    '#title' => t('Pending state access'),
+    '#description' => t('Only applies if editing is permitted by accounting standards.').' (AJAX needed!)',
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed' => isset($form_state['values']['pending']['access']),
+    '#weight' => 4,
+    'access' => array(
+      '#title' => t('Permissions to modfy pending transactions'),
+      '#type' => 'radios',
+      '#options' => array(
+        0 => t("Only users with '@permission' can correct pending transactions", array('@permission' => t('manage all transactions'))),
+        1 => t("Only currency owner can correct pending transactions", array('@permission' => t('manage all transactions'))),
+        2 => t('Only Transaction owner can correct pending transactions'),
+        3 => t('Both participants can correct pending transactions'),
+      ),
+      '#default_value' => !empty($form_state['values']['pending']['access']) ?
+        $form_state['values']['pending']['access'] :
+        (isset($currency->pending['access']) ?
+          $currency->pending['access'] : 0),
+      '#weight' => 4
+    ),
+    'signoff' => array(
+      '#title' => t('Permissions to sign off transactions'),
+      '#type' => 'radios',
+      '#options' => array(
+        0 => t("Only signatories can sign their names", array('@permission' => t('manage all transactions'))),
+        1 => t("Users with permission to 'manage all transactions' can sign off transactions"),
+      ),
+      '#default_value' => !empty($form_state['values']['pending']['signoff']) ?
+        $form_state['values']['pending']['signoff'] :
+        (isset($currency->pending['signoff']) ? $currency->pending['signoff'] : 0),
+      '#weight' => 4
+    )
+  );
+  return $form;
+}
+
+
+/*
+ * Needed for the views 2 module
+ */
+function mcapi_pending_views_api() {
+  return array(
+    'api' => 2,
+    'path' => drupal_get_path('module', 'mcapi_pending') .'/views',
+  );
+}
+
+
+//returns a list of the user objects who are yet to sign
+function mcapi_get_signatories($transaction) {
+  $uids = db_select('mcapi_unsigned', 'u')->fields('u', array('uid'))->condition('xid', $transaction->xid)->execute()->fetchCol();
+  return user_load_multiple($uids);
+}
+
+
+/*
+ * Bit of a one off, this one
+ */
+function mcapi_format_usernames($accounts) {
+  foreach($accounts as $account) {
+    $names[] = format_username($account);
+  }
+  $output = implode(' & ' ,$names);
+  return $output;
+}
+
+/*
+ * Implements ctools hook_ctools_plugin_api
+ */
+function mcapi_pending_ctools_plugin_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'mcapi_pending'),
+  );
+}
+
+/*
+ * implements hook_form_FORMID_alter
+ * bumps the signature form up to stage 2, where the fields are rendered as text
+ */
+function mcapi_pending_form_add_my_signature_alter(&$form, &$form_state) {
+  $form_state['step']++;
+
+  array_unshift($form['#submit'], 'add_my_signature_submit');
+  unset($form['buttons']['delete']);
+}
+
+
+function add_my_signature_submit($form, &$form_state) {
+  $transaction = &$form_state['#transaction'];
+  //remove the signatory from the transaction
+  if ($transaction->state = TRANSACTION_STATE_PENDING) {
+    mcapi_sign($transaction, arg(3));
+    drupal_set_message(t("Exchange #@xid is signed off.", array('@xid' => $transaction->xid)));
+  }
+}
+
+
+/*
+ * This menu callback is handled differently to the standard signing form
+ */
+function mcapi_signoff_confirm_form($form, $form_state, $transaction) {
+  $form = array();
+  $form_state['redirect'] = 'transaction/'. $transaction->xid;
+  $form['xid'] = array(
+    '#type' => 'hidden',
+    '#value' => $transaction->xid
+  );
+  $form['#prefix'] = t('Are you sure you want to sign this transaction on behalf of @users?',
+    array('@users' => mcapi_format_usernames(mcapi_get_signatories($transaction)))
+  );
+  return confirm_form(
+    $form,
+    t('Are you sure?'),
+    'user',
+    '',
+    t('Sign'), t('Cancel'),
+    'sign'
+  );
+}
+
+function mcapi_signoff_confirm_form_submit($form, &$form_state) {
+  $xid = $form_state['values']['xid'];
+  $uids = db_select('mcapi_unsigned', 'u')->fields('u', array('uid'))->condition('xid', $xid)->execute()->fetchCol();
+  $transaction = transaction_load($xid);
+  foreach ($uids as $uid) {
+    mcapi_sign($transaction, $uid);
+  }
+  drupal_set_message(t("Transaction #@xid is signed off.", array('@xid' => $xid)));
+  $form_state['redirect'] = 'transaction/'.$xid;
+}
+
+function mcapi_signall_confirm_form($form, $form_state, $account) {
+  $form = array();
+  $form['uid'] = array(
+    '#type' => 'hidden',
+    '#value' => $account->uid
+  );
+  $form['#prefix'] = t('Are you sure you want to sign all your transactions?');
+  return confirm_form(
+    $form,
+    t('Are you sure?'),
+    'user',
+    '',
+    t('Sign'), t('Cancel'),
+    'sign'
+  );
+}
+
+function mcapi_signall_confirm_form_submit($form, &$form_state) {
+  $uid = $form_state['values']['uid'];
+  //get all the transactions and sign them one by one
+  $xids = db_select('mcapi_unsigned', 'u')->fields('u', array('xid'))->condition('uid', $uid)->execute()->fetchCol();
+  $transactions = transaction_controller('load', $xids);
+  foreach ($transactions as $transaction) {
+    mcapi_sign($transaction, $uid);
+  }
+  $form_state['redirect'] = 'user';
+}
+
+
+/*
+ * Integration with mcapi_webforms module
+ *
+ * Implements hook_form_FORM_ID_alter
+ * modifies its own form to hide exceptional fields
+ * adds ajax to the state selector
+ * then if the state is set to pending, this inserts the checkboxes to require signatures in webforms
+ *
+ */
+function mcapi_pending_form_ctools_export_ui_edit_item_form_alter(&$form, &$form_state) {
+  $webform = &$form_state['item'];
+  if ($webform->path == 'transaction/%transaction/sign/%user_uid_optional') {
+    $form['path']['#disabled'] = TRUE;
+    $form['aspect']['#disabled'] = TRUE;
+    foreach(array('output', 'currcode', 'payer', 'payee', 'worth', 'step-2', 'workflow') as $fieldname) {
+      $form[$fieldname]['#access'] = FALSE;
+    }
+    $form['webform_fields'] = array(
+      '#type' => 'markup',
+      '#value' => t('Use the following tokens: @tokens', array('@tokens' => '[payer], [payee], [worth]')),
+    );
+  }
+  else{
+    $form['workflow']['outgoing']['#ajax'] = array(
+      'callback' => 'mcapi_webforms_ajax_settings',
+      'wrapper' => 'form-wrapper'
+    );
+    //this might need isset()...
+    if ($form['workflow']['outgoing']['#default_value'] == TRANSACTION_STATE_PENDING ) {
+      foreach (array('payer', 'payee', '2ndperson') as $participant) {
+        if (isset($form[$participant])) {
+          $form[$participant]['signature'] = array(
+            '#title' => t('User must sign before transaction completes'),
+            '#type' => 'checkbox',
+            '#default_value' => isset($webform->data[$participant]['signature']) ? $webform->data[$participant]['signature'] : FALSE,
+            '#weight' => 5
+          );
+        }
+      }
+    }
+  }
+}

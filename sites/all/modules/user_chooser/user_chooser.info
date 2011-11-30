@@ -1,0 +1,12 @@
+name = User chooser
+description = Provides a flexible form widget for choosing users, including autocompletion on uid, email and themed username
+core = 7.x
+
+files[] = user_chooser.module
+
+; Information added by drupal.org packaging script on 2011-05-05
+version = "7.x-1.0-beta1"
+core = "7.x"
+project = "user_chooser"
+datestamp = "1304633517"
+

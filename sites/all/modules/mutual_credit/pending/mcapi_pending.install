@@ -1,0 +1,26 @@
+<?php
+//Id;
+
+/**
+ * Implementation of hook_schema)().
+ * creates a table for storing signatures needed on pending transactions
+ */
+function mcapi_pending_schema() {
+  $schema['mcapi_unsigned'] = array(
+    'description' => 'signatories needed on pending transactions',
+    'fields' => array(
+      'xid' => array(
+        'description' => t('the transaction to which this entry is attached'),
+        'type' => 'int',
+        'size' => 'normal',
+      ),
+      'uid' => array(
+        'description' => t('the uid of the signatory'),
+        'type' => 'int',
+        'size' => 'normal',
+      )
+    ),
+    'primary key' => array('xid', 'uid')
+  );
+  return $schema;
+}

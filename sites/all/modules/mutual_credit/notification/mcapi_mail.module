@@ -1,0 +1,187 @@
+<?php
+
+/*
+ * Tabs on the currency edit form to compose the notification emails
+ */
+function mcapi_mail_form_ctools_export_ui_edit_item_form_alter(&$form, $form_state) {
+  $webform = &$form_state['item'];
+  $form['email_template'] = array(
+    '#title' => t('Mail notification'),
+    '#description' => implode(' ', array(
+      t('Edit the welcome e-mail messages sent to new member accounts created by an administrator.'),
+      t('Available variables are: [site:name], [site:url], [user:name], [user:mail], [site:login-url], [site:url-brief], [user:edit-url], [user:one-time-login-url], [user:cancel-url].'),
+      mcapi_get_tokens()
+    )),
+    '#type' => 'fieldset',
+    '#group' => 'webform_templates',
+    '#weight' => 3,
+    'subject' => array(
+      '#title' => t('Subject'),
+      '#type' => 'textfield',
+      '#default_value' => empty($webform->data['email_template']['subject']) ? _mcapi_mail_text('subject') : $webform->data['email_template']['subject'],
+      '#maxlength' => 180,
+    ),
+    'body' => array(
+      '#title' => t('Body'),
+      '#type' => 'textarea',
+      '#default_value' => empty($webform->data['email_template']['body']) ? _mcapi_mail_text('body') : $webform->data['email_template']['body'],
+      '#rows' => 10
+    ),
+    'send' => array(
+      '#title' => t('Send notification'),
+      '#description' => t("to users who 'let the system decide' on their profile page."),
+      '#type' => 'checkbox',
+      '#default_value' => empty($webform->data['email_template']['send']) ? FALSE : $webform->data['email_template']['send']
+    )
+  );
+}
+
+/*
+ * implementation of hook entity_insert
+ * triggers the insert mail
+ */
+function mcapi_mail_entity_insert($type, $transaction) {
+  if ($type == 'transaction') {
+    mcapi_mail_send('insert', $transaction);
+  }
+}
+/*
+ * implementation of hook entity_insert
+ * triggers the update mail
+ */
+function mcapi_mail_entity_update($type, $transaction) {
+  if ($type == 'transaction') {
+    mcapi_mail_send('update', $transaction);
+  }
+}
+//calculates whether to send mail, according to user preferences, and builds and sends
+function mcapi_mail_send($op, $transaction) {
+  $currency = currency_load($transaction->currcode);
+  if (module_exists('mcapi_webforms')) {
+    $webform = mcapi_webforms_load($transaction->type);
+    $subject = $webform->data['email_template']['subject'];
+    $body = $webform->data['email_template']['body'];
+    $send = $webform->data['email_template']['send'];
+  }
+  else{
+    drupal_set_message('Currently the mcapi_mail module only knows about the mail templates determined in mcapi_webforms module', 'warning');
+    drupal_set_message('Mail notification NOT sent.');
+    return;
+  }
+  foreach (array($transaction->payer, $transaction->payee) as $uid) {
+    $account = user_load($uid);
+    $pref = $account->data['mutual_credit_mail'];
+    //if the user wants notification for everything or he defers to the form settings and the form wants to send
+    //there's no use case here for 'minimal
+    if ($pref == 2 || ($pref == 1 && $send) || ($GLOBALS['user']->uid != $uid && $send)) {
+      $message = drupal_mail(
+        'mcapimail',
+        $op,
+        $account->mail,
+        user_preferred_language($account),
+        array(
+          'recipient' => $account,
+          'transaction' => $transaction,
+        ),
+        NULL, //defualts to site_mail
+        TRUE //don't send it
+      );
+    }
+  }
+}
+
+/*
+ * implements hook_mail
+ * $key can be insert or update. delete is also a possiblity
+ */
+function mcapimail_mail($key, &$message, $params) {
+  $language = $message['language'];
+  $variables = array(
+    'transaction' => $params['transaction'],
+    'user' => $params['recipient']
+  );
+  $message['subject'] =  _mcapi_mail_text('subject', $language, $variables);
+  $message['body'][] =  _mcapi_mail_text('body', $language, $variables);
+}
+
+function _mcapi_mail_text($key, $language = NULL, $variables = array(), $replace = TRUE) {
+  if ($template = variable_get($key, NULL)) {
+    $text = $template;
+  }
+  else {
+    switch($key) {
+      case 'subject':
+        $text = t('Exchange saved with [transaction:partner]');
+        break;
+      case 'body':
+        $text =  t("[user:name],
+
+A transaction for [transaction:worth] has been saved with [transaction:partner]
+
+More details can be found at
+[transaction:uri]
+
+To change your notification settings, visit your profile at
+[user:edit-url]
+
+The team at [site:name]");
+        break;
+    }
+  }
+  // We do not sanitize the token replacement, since the output of this
+  // replacement is intended for an e-mail message, not a web browser.
+  return token_replace(
+    $text,
+    $variables,
+    array('language' => $language, 'sanitize' => FALSE)
+  );
+}
+
+
+/*
+ * Admin writes the emails using tokens, then, according to some checkboxes in the user profile,
+ * this module will email users with notifications about transactions in which they are involved
+ */
+function mcapi_mail_form_user_profile_form_alter(&$form, $form_state) {
+  $account = user_load($form['#user']->uid);
+  $form['mutual_credit_notifications'] = array(
+    '#title' => t('Transaction notifications'),
+    '#description' => t('The system will inform you when you are involved in transactions'),
+    '#type' => 'fieldset',
+    'mutual_credit_mail' => array(
+      '#title' => t('Mail me when'),
+      '#description' => t('Choose when to receive mail notifications'),
+      '#type' => 'radios',
+      '#options' => array(
+        '0' => t('Only when my attention is required'),
+        '1' => t('Let the system decide'),
+        '2' => t('For any currency activity involving my account ')
+      ),
+      '#default_value' => isset($form['#user']->data['mutual_credit_mail']) ? $form['#user']->data['mutual_credit_mail'] : array()
+    )
+  );
+}
+
+/*
+ * implements hook_user_presave
+ * injects the notification preferences into the account object
+ */
+function mcapi_mail_user_presave(&$edit, $account, $category) {
+  if ($category != 'account') return;
+  $edit['data']['mutual_credit_mail'] = $edit['mutual_credit_mail'];
+}
+
+/*
+ * Implements ctools hook default_mcapi_webforms
+ * adds the mail template to the default webforms (only those which haven't been overridden)
+ * should possibly go in mcapi_mail.mcapi_inc, but that file isn't being included
+ */
+function mcapi_mail_default_mcapi_webforms_alter(&$webforms) {
+  foreach ($webforms as $path => $webform) {
+    $webforms[$path]->data['email_template'] = array(
+      'subject' => _mcapi_mail_text('subject'),
+      'body' => _mcapi_mail_text('body'),
+      'send' => TRUE,
+    );
+  }
+}

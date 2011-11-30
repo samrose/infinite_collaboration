@@ -1,0 +1,18 @@
+; $Id: 
+name = Limit balances
+description = Sets global and personal balance limits for each currency
+package = Mutual Credit
+core = 7.x
+
+files[] = mcapi_limits.module
+dependencies[] = mcapi
+
+files[] = views/views_handler_field_mcapi_min.inc
+files[] = views/views_handler_field_mcapi_max.inc
+
+; Information added by drupal.org packaging script on 2011-11-03
+version = "7.x-3.0-beta1"
+core = "7.x"
+project = "mutual_credit"
+datestamp = "1320348035"
+

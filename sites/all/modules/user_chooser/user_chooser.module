@@ -1,0 +1,345 @@
+<?php
+// $Id:
+
+function user_chooser_help($path) {
+  if ($path == 'admin/config/people/user_chooser') {
+    return t('This is a utility module which provides a form widget to module developers. For examples, visit !link',
+      array('!link' => l('uchootest', 'uchootest')));
+  }
+}
+
+/*
+ * User chooser module
+ *
+ * Just a special form field at the moment, no configuration pages
+ * Use it like this:
+ * $form['fieldname'] = array(
+ *   '#title' => t('Blah blah'),
+ *   '#type' => 'user_chooser', // or 'user_chooser_roles' or 'user_chooser_permissions' or 'user_chooser_view'
+ *   '#args' => array('callback_function') // or the role ids or the permission key or the view and display ids
+ *   //etc.
+ * );
+ * where $callback is 'permission', 'role', or your own callback
+ * your own callback should return a list of usernames, with uid keys
+ *
+ * This module will modify $form_state[values][fieldname] to be the uid, regardless of what was selected
+ */
+
+function user_chooser_menu() {
+  $items['system/ajax/uchoo'] = array(
+    'page callback' => 'uchoo_autocomplete',
+    'access arguments' => array('access user profiles'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/config/people/user_chooser'] = array(
+    'title' => 'User Chooser Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('uchoo_config_form'),
+    'access arguments' => array('administer modules'),
+    'weight' => 5
+  );
+  //this is for developers only!
+  $items['uchootest'] = array(
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('uchoo_demo_form'),
+    'access arguments' => array('administer modules'),
+    'weight' => 5,
+    'type' => MENU_CALLBACK
+  );
+  return $items;
+}
+
+
+/*
+ * implements hook_element_info
+ * the three elements we are offer are essentially the same
+ */
+function user_chooser_element_info() {
+  $fields = array(
+    '#input' => TRUE,
+    '#process' => array('process_uchoo'),
+    '#element_validate' => array('user_chooser_validate'),
+    '#args' => array(),
+    '#theme_wrappers' => array('form_element'),
+    '#multiple' => FALSE
+  );
+  return array(
+    'user_chooser_callback' => $fields,
+    'user_chooser_roles' => $fields,
+    'user_chooser_permissions' => $fields,
+  );
+}
+
+/*
+ * Callback function to process the form element
+ * provides all the other metadata for the form element
+ */
+function process_uchoo($element, $form_state) {
+  //before anything, we have to work out how many users are valid
+  if ($users = uchoo_get_users($element['#type'], $element['#args'])) {
+    if (count($users) < variable_get('user_chooser_threshhold', 50)) {
+      $element['#theme'] = 'select';
+      //$element['#options'] = array(0 => t('Please Choose...'));
+      $element['#options'] = uchoo_display_all($users);
+      $element = form_process_select($element);
+      if (empty($element['#default_value']) && !empty($form_state['values'][$element['#name']])) {
+        $element['#default_value'] = $form_state['values'][$element['#name']];
+      }
+    }
+    else {
+      $element['#theme'] = 'textfield';
+      $element['#autocomplete_path'] = 'system/ajax/uchoo/'.$element['#type'].'/'.implode('/', $element['#args']);
+      $element['#description'] =  t('A username, email, or user ID');
+      if (empty($element['#default_value']) && !empty($form_state['values'][$element['#name']])) {
+        $uid = user_chooser_get_uid($element['#value']);
+        $element['#value'] = user_load($uid)->name;
+      }
+    }
+  }
+  else {
+    drupal_set_message(t("No users available to widget type '@type' with param @params", array(
+        '@type' => $element['#type'],
+        '@params' => implode(',', $element['#args']))
+      ),
+      'error'
+    );
+    return;
+  }
+  $element['#element_validate'][] = 'user_chooser_validate';
+  return $element;
+}
+
+//checks that all submited values are in fact in the list.
+function user_chooser_validate(&$element, &$form_state) {
+  if (is_string($element['#value']))$element['#value'] = array($element['#value']);
+  //if text was submitted rather than an integer, get the uid.
+  $uids = array();
+  foreach ($element['#value'] as $string) {
+    $uid = user_chooser_get_uid($string);
+    if (!$uid) {//users who don't exist
+      $invalids[] = $string;
+    }
+    else{
+      $uids[] = $uid;
+    }
+  }
+  $users = uchoo_get_users($element['#type'], $element['#args']);
+  foreach ($uids as $uid) {
+    if (empty($users[$uid])) {
+      //users who are filtered out
+      $invalids[] = $uid;
+    }
+  }
+  if (!empty($invalids)) {
+    form_error($element, t('Invalid user: @uids', array('@uids' => implode(', ', $invalids))));
+    //set the contents of the field back to the errant value
+    $element['#value'] = $form_state['values'][$element['#name']];
+  }
+}
+
+function user_chooser_get_uid($string) {
+  return db_select('users', 'u')
+  ->fields('u', array('uid'))
+  ->condition('uid', 0, '!=')
+  ->condition(db_or()
+    ->condition('uid', $string)
+    ->condition('name', $string)
+    ->condition('mail', $string)
+  )
+  ->execute()
+  ->fetchField();
+}
+
+
+//ajax menu callback
+//first arg is the widget type, last arg is the string entered
+function uchoo_autocomplete($type) {
+  $args = func_get_args();
+  array_shift($args);
+  $string = array_pop($args);
+  $users = uchoo_get_users($type, $args, $string);
+  $names = uchoo_display_all($users);
+  drupal_json_output($names);
+  die();
+}
+
+//retrives an array of user ids according to the form widget parameters and optionally the string from the autocomplete field.
+//note that the $args may be keyed, esp for user_chooser_conditions
+function uchoo_get_users($type, $args, $string = '') {
+  //get the relevent settings
+  $filters = variable_get('user_chooser_filters', array('status', 'authenticated'));
+  $matching = variable_get('user_chooser_matching', array('u.uid', 'u.name', 'u.mail'));
+
+  //deal with the types which do their own db queries
+  switch ($type) {
+    case 'user_chooser_callback':
+      //first arg has to be the callback function
+      $callback = array_shift($args);
+      return call_user_func($callback, $args, $string);
+    case 'user_chooser_view':
+      drupal_set_message("user_chooser_view' hasn't been written yet");
+  }
+
+  //if we're still here, the rest of the options use a query
+  $query = db_select('users', 'u');
+  if (strlen($string)) {
+    $or = db_or();
+    foreach ($matching as $field) {
+      $query->condition($or->condition($field, db_like($string) . '%', 'LIKE'));
+    }
+  }
+  if (in_array('status', $filters)) {
+    $query->condition('u.status', TRUE);
+  }
+  if (in_array('authenticated', $filters)) {
+    $query->condition('u.uid', 0, '!=');
+  }
+  switch ($type) {
+    case 'user_chooser_permissions':
+      $rids = array();
+      foreach($args as $perm) {
+        $rids = array_merge($rids, user_roles(TRUE, array_pop($args)));
+      }
+      if (!count($args)) continue;
+      $args = array_keys($rids);
+      //then use the roles method
+    case 'user_chooser_roles':
+      $pos = array_search(DRUPAL_AUTHENTICATED_RID, $args);
+      if (is_numeric($pos)) { //special case for role 2
+        unset($args[$pos]);
+        $query->condition('u.status', TRUE);
+      }
+      if (count($args)) {//continue;
+        $query->join('users_roles', 'ur', 'ur.uid = u.uid');
+        $query->condition('ur.rid', $args);
+      }
+      break;
+    default:
+      drupal_set_message(t('Unsupported element #type'));
+  }
+  $query->range(0, variable_get('user_chooser_threshhold', 50));
+  return $query->fields('u', array('uid', 'name', 'mail'))->execute()->fetchAllAssoc('uid');
+}
+
+
+//takes an array of pseudo users and formats them for display
+function uchoo_display_all($users) {
+  $template = variable_get('user_chooser_format', '[user:name]');
+  //convert the vars in the template to token-like strings
+  //$accounts = user_load_multiple($uids);
+  $names = array();
+  foreach ($users as $uid => $account) {
+    $names[$uid] = token_replace($template, array('user' => $account));
+  }
+  return $names;
+}
+
+/*
+ * Settings form to set global restrictions
+ */
+function uchoo_config_form() {
+  $form = array (
+    'user_chooser_threshhold' => array(
+      '#title' => t('Autocomplete threshhold'),
+      '#description' => t('Below this number of items, a select box is shown, above it, an autocomplete field'),
+      '#type' => 'textfield',
+      '#size' => 3,
+      '#maxlength' => 3,
+      '#default_value' => variable_get('user_chooser_threshhold', 50),
+      '#element_validate' => array('_element_validate_integer')
+    ),
+    'user_chooser_format' => array(
+      '#title' => t('Display format'),
+      '#description' => t('At least one of the following tokens must be used:') .implode(',', _uchoo_tokens()),
+      '#type' => 'textfield',
+      '#maxlength' => 64,
+      '#default_value' => variable_get('user_chooser_format', '[user:name]'),
+      '#element_validate' => array('uchoo_validate_format')
+    ),
+    'user_chooser_matching' => array(
+      '#title' => t('Fields to match against'),
+      '#description' => t('The autocomplete widget will get matches based on which fields?') .' '. t('Only applies to permission role and conditions based widgets.'),
+      '#type' => 'checkboxes',
+      '#options' => array(
+        'u.uid' => t('User ID'),
+        'u.name' => t('Username'),
+        'u.mail' => t('Email'),
+      ),
+      '#default_value' => variable_get('user_chooser_matching', array('u.uid', 'u.name', 'u.mail')),
+      '#weight' => 2
+    ),
+    'user_chooser_filters' => array(
+      '#title' => t('Other global filters'),
+      '#description' => t('Only applies to permission role and conditions based widgets.'),
+      '#type' => 'checkboxes',
+      '#options' => array(
+        'status' => t('Exclude blocked users'),
+        'authenticated' => t('Only allow authenticated users'),
+      ),
+      '#default_value' => variable_get('user_chooser_filters', array('status', 'authenticated')),
+      '#weight' => 3
+    )
+  );
+  return system_settings_form($form);
+}
+
+/*
+ * validation callback for settings form element
+ */
+function uchoo_validate_format(&$element, $form_state) {
+  foreach (_uchoo_tokens() as $token) {
+    if (is_numeric(strpos($element['#value'], $token))) return;
+  }
+  form_error($element, t('At least one of the following tokens must be used:') .implode(',', _uchoo_tokens()));
+}
+
+
+
+/*
+ * NOT an implementation of hook_tokens, just a local utility
+ */
+function _uchoo_tokens() {
+  return array('[user:name]', '[user:mail]', '[user:uid]');
+}
+
+
+/*
+ * Demo functions
+ */
+function uchoo_demo_form() {
+  $demo_form = array(
+    'callback' => uchoo_test_field('callback', array('_test_callback')),
+    'permission' => uchoo_test_field('permission', array('access user profiles', 'blah')),
+    'roles' => uchoo_test_field('roles',  array(3)),
+    //'view' => uchoo_test_field('view', $option = NULL),
+  );
+  foreach ($demo_form as $key => $field) {
+    $demo_form[$key]['#prefix'] = '<pre>'.print_r($field, 1).'</pre>';
+  }
+  $demo_form['submit'] = array('#type' => 'submit', '#value' => t('submit'));
+  return $demo_form;
+}
+
+function uchoo_test_field($method = NULL, $extra = NULL) {
+  return array(
+    '#title' => t('Testfield: @type', array('@type' => $method)),
+    '#type' => 'user_chooser_'.$method,
+    '#multiple' => TRUE,
+    '#status' => TRUE,
+    '#args' => $extra
+  );
+}
+
+/*
+ * Should return an array of objects, keyed by uid, where each object contains uid, name and email at least
+ */
+function _test_callback($args) {
+  return array(
+    1 => (object)array(
+      'uid' => 1,
+      'name' => 'matslats',
+      'mail' => 'matslats@gmail.com'
+    ),
+    2 => user_load(2)
+  );
+}

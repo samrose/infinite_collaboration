@@ -1,0 +1,21 @@
+; $Id: 
+name = Parallel currency playground
+description = Full multiple currency support. Many currencies in one community, or even in one transaction. Or run overlapping economies.
+package = Mutual Credit
+configure = admin/accounting/currencies
+core = "7.x"
+
+dependencies[] = mcapi
+dependencies[] = ctools
+;dependencies[] = mcapi_currencies
+
+files[] = mcapi_currencies.install
+files[] = plugins/export_ui/export_ui.inc
+files[] = plugins/export_ui/mcapi_currencies_ui.class.php
+
+; Information added by drupal.org packaging script on 2011-11-03
+version = "7.x-3.0-beta1"
+core = "7.x"
+project = "mutual_credit"
+datestamp = "1320348035"
+
